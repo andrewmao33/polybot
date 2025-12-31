@@ -1,0 +1,7 @@
+websockets>=12.0
+websocket-client>=1.6.0
+aiohttp>=3.9.0
+sortedcontainers>=2.4.0
+python-dotenv>=1.0.0
+certifi>=2023.0.0
+
