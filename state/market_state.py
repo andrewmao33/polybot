@@ -35,6 +35,9 @@ class MarketState:
         self.asset_id_yes: Optional[str] = None
         self.asset_id_no: Optional[str] = None
         
+        # Market slug for identification
+        self.slug: Optional[str] = None
+        
         # Oracle data
         self.btc_price: Optional[float] = None
         
@@ -132,6 +135,7 @@ class MarketState:
         snapshot.order_book_no_asks = SortedDict(self.order_book_no_asks)
         snapshot.asset_id_yes = self.asset_id_yes
         snapshot.asset_id_no = self.asset_id_no
+        snapshot.slug = self.slug
         snapshot.btc_price = self.btc_price
         snapshot.exchange_timestamp = self.exchange_timestamp
         snapshot.local_timestamp = self.local_timestamp

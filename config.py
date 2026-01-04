@@ -23,8 +23,11 @@ ORACLE_BLOCK_YES = 0.30  # Block YES buys if Model < 0.30 (was 0.40 - more permi
 ORACLE_BLOCK_NO = 0.70   # Block NO buys if Model > 0.70 (was 0.60 - more permissive)
 
 # Execution Constants
-LATENCY_MS = 0.150  # Simulated network round-trip time (150ms)
+LATENCY_MS = 150  # Simulated network round-trip time (150ms)
 PAYOUT_TICKS = 1000  # Payout per winning share (1000 ticks = $1.00)
+EXECUTION_MODE = "simulated"  # "simulated" or "real"
+SIMULATE_PARTIAL_FILLS = True
+PARTIAL_FILL_DELAY_MS = 200  # Delay between partial fills (ms)
 
 # WebSocket Endpoints
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

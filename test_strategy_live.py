@@ -1,14 +1,17 @@
 """
 Live strategy testing with real market data.
-Integrates strategy engine with ingestion layer.
+Integrates strategy engine with ingestion layer and execution layer.
 """
 import asyncio
 import logging
 import time
+import sys
 from ingestion.orchestrator import IngestionOrchestrator
 from state.market_state import MarketState
 from state.position_state import PositionState
 from strategy.engine import evaluate_strategy
+from execution.execution_engine import ExecutionEngine
+import config
 
 # Configure logging
 logging.basicConfig(
@@ -31,7 +34,7 @@ class MessageFilter(logging.Filter):
 ws_logger.addFilter(MessageFilter())
 
 
-def on_market_state_update(state: MarketState):
+async def on_market_state_update(state: MarketState, execution_engine: ExecutionEngine):
     """Callback when market state updates - evaluate strategy."""
     # Only evaluate if both order books are synced
     if not state.sync_status:
@@ -40,7 +43,6 @@ def on_market_state_update(state: MarketState):
     # Log when we first start evaluating (after sync)
     if not hasattr(on_market_state_update, '_first_eval'):
         on_market_state_update._first_eval = True
-        on_market_state_update._position = PositionState(market_id=state.market_id)
         on_market_state_update._start_time = time.time()
         on_market_state_update._last_portfolio_log = time.time()
         logger.info("\n" + "="*60)
@@ -48,9 +50,8 @@ def on_market_state_update(state: MarketState):
         logger.info("="*60 + "\n")
     on_market_state_update._first_eval = False
     
-    # Use persistent position state (maintains inventory across evaluations)
-    # In production, this would come from the execution layer
-    position = on_market_state_update._position
+    # Get position state from execution engine
+    position = execution_engine.position_state
     
     # Get a snapshot of the market state (atomic)
     market_snapshot = state.snapshot()
@@ -101,7 +102,8 @@ def on_market_state_update(state: MarketState):
         no_str = f"{best_ask_no:.1f}" if best_ask_no is not None else "N/A"
         btc_str = f"${state.btc_price:,.0f}" if state.btc_price is not None else "N/A"
         time_str = f"{time_rem:.1f}m" if time_rem is not None else "N/A"
-        logger.info(f"\n📊 Market Update #{on_market_state_update._update_count}: "
+        slug = state.slug if hasattr(state, 'slug') and state.slug else "unknown"
+        logger.info(f"\n📊 Market Update #{on_market_state_update._update_count} [{slug}]: "
                    f"YES={yes_str} | NO={no_str} | "
                    f"BTC={btc_str} | {strike_info} | T={time_str}")
     
@@ -114,29 +116,26 @@ def on_market_state_update(state: MarketState):
         if on_market_state_update._update_count % 100 == 0:
             logger.debug(f"No signals (update #{on_market_state_update._update_count})")
     else:
+        # Highlight buy signals prominently
+        slug = state.slug if hasattr(state, 'slug') and state.slug else "unknown"
         logger.info(f"\n{'='*60}")
-        logger.info(f"📊 STRATEGY SIGNALS GENERATED: {len(signals)}")
+        logger.info(f"🛒 BUY SIGNAL [{slug}]: {len(signals)} signal(s)")
+        logger.info(f"{'='*60}")
         for i, signal in enumerate(signals, 1):
-            logger.info(f"\n  Signal {i}:")
-            logger.info(f"    Side: {signal.side}")
-            logger.info(f"    Price: {signal.price:.1f} ticks (${signal.price/1000:.3f})")
-            logger.info(f"    Size: {signal.size:.1f} shares")
-            logger.info(f"    Priority: {signal.priority}")
-            logger.info(f"    Reason: {signal.reason}")
+            logger.info(f"  [{i}] {signal.side} @ ${signal.price/1000:.3f} ({signal.price:.1f} ticks) × {signal.size:.1f} shares")
+            logger.info(f"      Priority: {signal.priority} | Reason: {signal.reason}")
         
-        # Simulate execution: update position state (for testing only)
-        # In production, the execution layer would do this after orders fill
+        # Execute signals via execution engine
         for signal in signals:
-            if signal.side == "YES":
-                position.Qy += signal.size
-                position.Cy += signal.price * signal.size
-            elif signal.side == "NO":
-                position.Qn += signal.size
-                position.Cn += signal.price * signal.size
+            try:
+                order = await execution_engine.execute_signal(signal, state)
+                logger.info(f"  ✅ ORDER SUBMITTED: {order.order_id} | Status: {order.status.value}")
+            except Exception as e:
+                logger.error(f"  ❌ ORDER FAILED: {e}", exc_info=True)
         
-        # Log current position
-        logger.info(f"\n  📍 Current Position: Qy={position.Qy:.1f}, Qn={position.Qn:.1f}, "
-                   f"Cy={position.Cy:.1f}, Cn={position.Cn:.1f}")
+        # Log current position (will be updated by execution engine on fills)
+        logger.info(f"\n  📊 Position: YES={position.Qy:.1f} shares (${position.Cy/1000:.2f}) | "
+                   f"NO={position.Qn:.1f} shares (${position.Cn/1000:.2f})")
         logger.info(f"{'='*60}\n")
 
 
@@ -145,11 +144,40 @@ async def main():
     logger.info("Starting live strategy testing...")
     logger.info("Strategy will evaluate on every market state update")
     
-    orchestrator = IngestionOrchestrator(on_market_state_update=on_market_state_update)
+    # Create execution engine
+    execution_engine = ExecutionEngine(
+        mode=config.EXECUTION_MODE,
+        position_state=None  # Will be set after market discovery
+    )
+    
+    # Store execution engine for callback access
+    on_market_state_update._execution_engine = execution_engine
+    
+    # Create callback wrapper
+    def market_update_callback(state: MarketState):
+        # Get execution engine from closure
+        exec_engine = on_market_state_update._execution_engine
+        # Schedule async callback
+        asyncio.create_task(on_market_state_update(state, exec_engine))
+    
+    # Create callback for position state resets
+    def position_state_reset_callback(new_position_state: PositionState):
+        """Called whenever orchestrator creates a new PositionState (market switch or init)."""
+        execution_engine.set_position_state(new_position_state)
+        logger.info(f"✅ Execution engine position state updated for market: {new_position_state.market_id}")
+    
+    orchestrator = IngestionOrchestrator(
+        on_market_state_update=market_update_callback,
+        on_position_state_reset=position_state_reset_callback
+    )
     
     try:
         # Initialize first to check for errors
         await orchestrator.initialize()
+        
+        # Position state is already set via callback during initialize(), but this ensures it's set
+        if orchestrator.position_state:
+            execution_engine.set_position_state(orchestrator.position_state)
         
         # Check if strike price was extracted correctly
         if orchestrator.market_state and orchestrator.market_state.strike_price == 0:

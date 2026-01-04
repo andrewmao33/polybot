@@ -82,6 +82,37 @@ async def get_current_btc_15m_market(
     )
 
 
+async def get_next_btc_15m_market(
+    session: aiohttp.ClientSession, 
+    now: Optional[int] = None
+) -> Dict:
+    """
+    Get the next BTC 15-minute market.
+    
+    Args:
+        session: aiohttp session
+        now: Current timestamp (defaults to current time)
+    
+    Returns:
+        Market data dict
+    
+    Raises:
+        RuntimeError: If market not found
+    """
+    now = now or int(time.time())
+    start = (now - (now % 900)) + 900
+    
+    slug = f"btc-updown-15m-{start}"
+    market = await fetch_market_by_slug(session, slug)
+    
+    if market is not None:
+        return market
+    
+    raise RuntimeError(
+        f"Could not find next BTC 15m market (tried slug: {slug})"
+    )
+
+
 async def extract_market_metadata(market: Dict) -> Dict:
     """
     Extract relevant metadata from Gamma API market response.
@@ -134,6 +165,9 @@ async def extract_market_metadata(market: Dict) -> Dict:
         elif outcome == "NO" or outcome == "NO TOKEN":
             asset_id_no = token_id
     
+    # Extract slug from market
+    slug = market.get("slug", "")
+    
     return {
         "market_id": condition_id,
         "asset_id_yes": asset_id_yes,
@@ -142,6 +176,7 @@ async def extract_market_metadata(market: Dict) -> Dict:
         "end_timestamp": end_timestamp,
         "clob_token_ids": clob_token_ids,
         "description": description,
+        "slug": slug,
         "active": market.get("active", False),
         "closed": market.get("closed", False),
     }

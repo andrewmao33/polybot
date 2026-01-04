@@ -42,7 +42,13 @@ def evaluate_strategy(
         - No signals generated
         - Profit is locked (halt trading)
         - Stop loss triggered (execution layer should handle selling)
+        - Strike price unknown (entered market mid-period)
     """
+    # Don't trade if strike price is unknown (entered market mid-period)
+    # Strike price is only known when switching to a new market
+    if market_state.strike_price <= 0:
+        return None  # Strike price unknown - wait for next market switch
+    
     # Priority 3: Check profit lock first (highest priority safety check)
     if check_profit_lock(market_state, position_state):
         # Profit is locked - halt all trading

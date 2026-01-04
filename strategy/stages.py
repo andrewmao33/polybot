@@ -48,6 +48,14 @@ def check_synthetic_arbitrage(
     if total_cost >= 1000:
         return None  # No arbitrage opportunity
     
+    # Don't generate arbitrage signals if we already have pending orders for either side
+    if position_state.pending_yes or position_state.pending_no:
+        return None  # Already have pending orders, wait for them to fill
+    
+    # Don't generate arbitrage if we already have both sides (already locked in profit)
+    if position_state.has_both_sides():
+        return None  # Already have arbitrage position, don't buy more
+    
     # Calculate guaranteed profit
     profit_ticks = 1000 - total_cost
     
@@ -162,6 +170,10 @@ def check_bootstrap_stage(
     if not position_state.is_empty():
         return None
     
+    # Check MAX_SHARES limit - don't bootstrap if already at limit
+    if position_state.Qy >= config.MAX_SHARES or position_state.Qn >= config.MAX_SHARES:
+        return None  # Already at max exposure, don't bootstrap
+    
     # Need both order books to be synced
     if not market_state.sync_status:
         return None
@@ -205,6 +217,11 @@ def check_bootstrap_stage(
         cheaper_side = "NO"
         cheaper_price = best_ask_no
         cheaper_size = market_state.get_best_ask_size_no()
+    
+    # Don't generate signal if we already have a pending order for this side
+    if (cheaper_side == "YES" and position_state.pending_yes) or \
+       (cheaper_side == "NO" and position_state.pending_no):
+        return None  # Already have pending order for this side
     
     # Check if price is below threshold
     if cheaper_price >= price_threshold:
@@ -257,6 +274,11 @@ def check_hedging_stage(
     if imbalance <= config.BALANCE_PAD:
         return None  # Position is balanced enough
     
+    # Check MAX_SHARES limit - but allow hedging even if at limit (to reduce risk)
+    # If both sides are at MAX_SHARES, we can't hedge more
+    if position_state.Qy >= config.MAX_SHARES and position_state.Qn >= config.MAX_SHARES:
+        return None  # Both sides at max, can't hedge
+    
     # Need both order books to be synced
     if not market_state.sync_status:
         return None
@@ -290,6 +312,11 @@ def check_hedging_stage(
     if light_ask_price is None:
         return None
     
+    # Don't generate signal if we already have a pending order for the light side
+    if (light_side == "YES" and position_state.pending_yes) or \
+       (light_side == "NO" and position_state.pending_no):
+        return None  # Already have pending order for light side
+    
     # Calculate price limit: TARGET_PAIR - Avg_Cost_Heavy
     # This ensures we can lock in a profit when we complete the pair
     price_limit = config.TARGET_PAIR - heavy_avg_cost
@@ -305,9 +332,15 @@ def check_hedging_stage(
         return None
     
     # Calculate trade size
-    # We want to buy enough to reduce imbalance, but not exceed MAX_TRADE
-    # Ideally, we'd buy enough to balance, but we're limited by available size
-    trade_size = min(light_ask_size, config.MAX_TRADE)
+    # We want to buy enough to reduce imbalance, but not exceed MAX_TRADE or MAX_SHARES
+    # Check how much we can buy without exceeding MAX_SHARES on the light side
+    current_light_qty = position_state.Qy if light_side == "YES" else position_state.Qn
+    max_allowed = max(0, config.MAX_SHARES - current_light_qty)
+    
+    if max_allowed <= 0:
+        return None  # Already at MAX_SHARES on light side
+    
+    trade_size = min(light_ask_size, config.MAX_TRADE, max_allowed)
     
     # Create signal
     signal = TradeSignal(
@@ -351,6 +384,10 @@ def check_averaging_down_stage(
     if not market_state.sync_status:
         return None
     
+    # Check MAX_SHARES limit - don't average down if at limit
+    if position_state.Qy >= config.MAX_SHARES or position_state.Qn >= config.MAX_SHARES:
+        return None
+    
     # Check if we have a position on at least one side
     has_yes = position_state.Qy > 0
     has_no = position_state.Qn > 0
@@ -378,6 +415,10 @@ def check_averaging_down_stage(
                     
                     # Check if we can buy more YES without exceeding imbalance
                     if balance_limit > 0:
+                        # Don't generate signal if we already have a pending order for YES
+                        if position_state.pending_yes:
+                            return None  # Already have pending order for YES
+                        
                         ask_size_yes = market_state.get_best_ask_size_yes()
                         if ask_size_yes > 0:
                             # Calculate trade size (limited by balance cap and MAX_TRADE)
@@ -415,6 +456,10 @@ def check_averaging_down_stage(
                     
                     # Check if we can buy more NO without exceeding imbalance
                     if balance_limit > 0:
+                        # Don't generate signal if we already have a pending order for NO
+                        if position_state.pending_no:
+                            return None  # Already have pending order for NO
+                        
                         ask_size_no = market_state.get_best_ask_size_no()
                         if ask_size_no > 0:
                             # Calculate trade size (limited by balance cap and MAX_TRADE)

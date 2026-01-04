@@ -30,17 +30,17 @@ class CoinbaseWebSocket:
     def __init__(
         self,
         market_state: MarketState,
-        on_price_update: Optional[Callable[[float], None]] = None
+        on_state_update: Optional[Callable[[MarketState], None]] = None
     ):
         """
         Initialize Coinbase WebSocket handler.
         
         Args:
             market_state: MarketState object to update
-            on_price_update: Optional callback when price updates
+            on_state_update: Callback function called when state updates
         """
         self.market_state = market_state
-        self.on_price_update = on_price_update
+        self.on_state_update = on_state_update
         
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.running = False
@@ -128,9 +128,9 @@ class CoinbaseWebSocket:
                         self.market_state.btc_price = price
                         logger.debug(f"BTC price updated: ${price:,.2f}")
                         
-                        # Notify callback if provided
-                        if self.on_price_update:
-                            self.on_price_update(price)
+                        # Notify state update callback if provided
+                        if self.on_state_update:
+                            self.on_state_update(self.market_state.snapshot())
                 except (ValueError, TypeError):
                     logger.warning(f"Invalid price value: {price_str}")
         elif message_type == "subscriptions":
@@ -147,5 +147,5 @@ class CoinbaseWebSocket:
     
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self.running and self.ws is not None and not self.ws.closed
+        return self.running and self.ws is not None
 

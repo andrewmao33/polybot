@@ -65,7 +65,7 @@ class PolymarketWebSocket:
                 # Subscribe to tokens
                 subscribe_message = {
                     "assets_ids": self.clob_token_ids,
-                    "type": "market"
+                    "operation": "subscribe"
                 }
                 
                 await self.ws.send(json.dumps(subscribe_message))
@@ -91,17 +91,10 @@ class PolymarketWebSocket:
     
     async def _handle_messages(self):
         """Process incoming WebSocket messages."""
-        message_count = 0
         try:
             async for message in self.ws:
-                message_count += 1
                 try:
                     data = json.loads(message)
-                    
-                    # Log every message for debugging (first 10, then every 50th)
-                    if message_count <= 10 or message_count % 50 == 0:
-                        logger.info(f"📨 Message #{message_count}: {json.dumps(data)[:200]}...")
-                    
                     await self._process_message(data)
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse message: {e}")
@@ -123,10 +116,7 @@ class PolymarketWebSocket:
             for i, book_data in enumerate(data):
                 if isinstance(book_data, dict) and book_data.get("event_type") == "book":
                     asset_id = book_data.get("asset_id")
-                    logger.debug(f"Processing book {i+1}: asset_id={asset_id}, YES={self.market_state.asset_id_yes}, NO={self.market_state.asset_id_no}")
                     await self._handle_book_message(book_data)
-                else:
-                    logger.debug(f"Skipping item {i+1}: not a book message (type={type(book_data)}, event_type={book_data.get('event_type') if isinstance(book_data, dict) else 'N/A'})")
             return
         
         # Handle dict messages
@@ -141,8 +131,6 @@ class PolymarketWebSocket:
             await self._handle_book_message(data)
         elif event_type == "price_change":
             await self._handle_price_change_message(data)
-        else:
-            logger.debug(f"Unknown event type: {event_type}, keys: {list(data.keys())[:5]}")
     
     async def _handle_book_message(self, data: dict):
         """
@@ -151,8 +139,6 @@ class PolymarketWebSocket:
         """
         asset_id = data.get("asset_id")
         timestamp = data.get("timestamp")
-        hash_value = data.get("hash")
-        
         if not asset_id:
             logger.warning("Book message missing asset_id")
             return
@@ -225,13 +211,11 @@ class PolymarketWebSocket:
         if is_yes:
             was_synced = self.market_state.sync_status
             self.market_state.sync_status_yes = True
-            logger.info(f"✅ YES book snapshot received (hash: {hash_value})")
             if not was_synced and self.market_state.sync_status:
                 logger.info("🎯 Both books now synced! (YES + NO)")
         else:
             was_synced = self.market_state.sync_status
             self.market_state.sync_status_no = True
-            logger.info(f"✅ NO book snapshot received (hash: {hash_value})")
             if not was_synced and self.market_state.sync_status:
                 logger.info("🎯 Both books now synced! (YES + NO)")
         
@@ -245,15 +229,12 @@ class PolymarketWebSocket:
         Updates specific price levels in the order book.
         """
         if not self.market_state.sync_status:
-            # Normal at startup - just wait for book snapshots
-            logger.debug("Received price_change before book snapshots (waiting for initial books...)")
             return
         
         timestamp = data.get("timestamp")
         price_changes = data.get("price_changes", [])
         
         if not price_changes:
-            logger.debug("Price change message has no price_changes")
             return
         
         for change in price_changes:
@@ -263,10 +244,6 @@ class PolymarketWebSocket:
             price = price_decimal * 1000
             size = float(change.get("size", 0))
             side = change.get("side")  # "BUY" or "SELL"
-            # Optional: best_bid and best_ask are also provided for validation
-            best_bid = change.get("best_bid")
-            best_ask = change.get("best_ask")
-            
             # Match asset_id against clob_token_ids (first = YES, second = NO)
             if len(self.clob_token_ids) == 2:
                 if asset_id == self.clob_token_ids[0]:
@@ -325,5 +302,75 @@ class PolymarketWebSocket:
     
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self.running and self.ws is not None and not self.ws.closed
+        return self.running and self.ws is not None
+    
+    async def unsubscribe(self, clob_token_ids: list[str]):
+        """
+        Unsubscribe from specified CLOB token IDs.
+        
+        Args:
+            clob_token_ids: List of CLOB token IDs to unsubscribe from
+        """
+        if not self.is_connected():
+            logger.warning("Cannot unsubscribe: WebSocket not connected")
+            return
+        
+        unsubscribe_message = {
+            "assets_ids": clob_token_ids,
+            "operation": "unsubscribe"
+        }
+        
+        await self.ws.send(json.dumps(unsubscribe_message))
+        logger.info(f"Unsubscribed from assets: {clob_token_ids}")
+    
+    async def subscribe(self, clob_token_ids: list[str]):
+        """
+        Subscribe to specified CLOB token IDs.
+        
+        Args:
+            clob_token_ids: List of CLOB token IDs to subscribe to
+        """
+        if not self.is_connected():
+            logger.warning("Cannot subscribe: WebSocket not connected")
+            return
+        
+        subscribe_message = {
+            "assets_ids": clob_token_ids,
+            "operation": "subscribe"
+        }
+        
+        await self.ws.send(json.dumps(subscribe_message))
+        logger.info(f"Subscribed to assets: {clob_token_ids}")
+    
+    async def switch_markets(self, new_clob_token_ids: list[str]):
+        """
+        Switch to a new market by unsubscribing from current and subscribing to new.
+        Resets sync status and clears order books.
+        
+        Args:
+            new_clob_token_ids: List of new CLOB token IDs to subscribe to
+        """
+        if not self.is_connected():
+            logger.warning("Cannot switch markets: WebSocket not connected")
+            return
+        
+        old_clob_token_ids = self.clob_token_ids.copy()
+        
+        # Reset sync status and clear order books for new market
+        self.market_state.sync_status_yes = False
+        self.market_state.sync_status_no = False
+        self.market_state.order_book_yes_bids.clear()
+        self.market_state.order_book_yes_asks.clear()
+        self.market_state.order_book_no_bids.clear()
+        self.market_state.order_book_no_asks.clear()
+        
+        # Run unsubscribe and subscribe concurrently
+        await asyncio.gather(
+            self.unsubscribe(old_clob_token_ids),
+            self.subscribe(new_clob_token_ids)
+        )
+        
+        # Update clob_token_ids after both operations complete
+        self.clob_token_ids = new_clob_token_ids
+        logger.info(f"✅ Market switched: {old_clob_token_ids} -> {new_clob_token_ids}")
 
