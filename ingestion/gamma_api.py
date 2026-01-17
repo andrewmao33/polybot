@@ -188,3 +188,26 @@ def get_ssl_context() -> ssl.SSLContext:
     """Get SSL context for API requests."""
     return _ssl_context
 
+
+async def fetch_btc_price(session: aiohttp.ClientSession) -> float:
+    """
+    Fetch current BTC price from Coinbase API (simple HTTP, no WebSocket needed).
+
+    Returns:
+        Current BTC price in USD
+    """
+    url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            if r.status == 200:
+                data = await r.json()
+                price = float(data["data"]["amount"])
+                logger.debug(f"Fetched BTC price: ${price:,.2f}")
+                return price
+            else:
+                logger.warning(f"Coinbase API returned {r.status}")
+                return 0.0
+    except Exception as e:
+        logger.error(f"Error fetching BTC price: {e}")
+        return 0.0
+

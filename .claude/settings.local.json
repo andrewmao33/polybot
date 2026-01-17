@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/bin/activate)",
+      "Bash(python:*)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "Bash(xargs ls:*)",
+      "Bash(python3:*)",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(find:*)"
+    ]
+  }
+}

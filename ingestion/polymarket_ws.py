@@ -1,13 +1,13 @@
 """
 Polymarket WebSocket ingestion handler.
-Connects to Polymarket CLOB and maintains real-time order book state.
+Connects to Polymarket CLOB and maintains best bid/ask state.
 """
 import asyncio
 import json
 import logging
 import ssl
 import websockets
-from typing import Callable, Optional
+from typing import Optional
 
 from state.market_state import MarketState
 
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# SSL context for testing
 _ssl_context = ssl.create_default_context()
 _ssl_context.check_hostname = False
 _ssl_context.verify_mode = ssl.CERT_NONE
@@ -24,353 +23,215 @@ _ssl_context.verify_mode = ssl.CERT_NONE
 class PolymarketWebSocket:
     """
     Handles WebSocket connection to Polymarket CLOB.
-    Maintains order book state and notifies on updates.
+    Only tracks best bid/ask - no full orderbook depth.
     """
-    
-    def __init__(
-        self,
-        market_state: MarketState,
-        clob_token_ids: list[str],
-        on_state_update: Optional[Callable[[MarketState], None]] = None
-    ):
-        """
-        Initialize Polymarket WebSocket handler.
-        
-        Args:
-            market_state: MarketState object to update
-            clob_token_ids: List of CLOB token IDs to subscribe to
-            on_state_update: Callback function called when state updates
-        """
+
+    def __init__(self, market_state: MarketState, clob_token_ids: list[str], on_state_update=None):
         self.market_state = market_state
         self.clob_token_ids = clob_token_ids
         self.on_state_update = on_state_update
-        
+
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.running = False
+        self._should_reconnect = True
         self.reconnect_delay = 1.0
         self.max_reconnect_delay = 60.0
-    
+
+        # Track if we've received initial books
+        self._got_initial_books = False
+
     async def connect(self):
         """Establish WebSocket connection and subscribe to markets."""
-        while not self.running:
+        self._should_reconnect = True
+        while self._should_reconnect:
             try:
-                logger.info(f"Connecting to Polymarket WebSocket for market {self.market_state.market_id}")
+                logger.info("Connecting to Polymarket WebSocket...")
                 self.ws = await websockets.connect(
                     POLYMARKET_WS_URL,
                     ssl=_ssl_context,
                     ping_interval=20,
                     ping_timeout=10
                 )
-                
-                # Subscribe to tokens
+
+                # Subscribe with custom_feature_enabled for best_bid_ask messages
                 subscribe_message = {
                     "assets_ids": self.clob_token_ids,
-                    "operation": "subscribe"
+                    "operation": "subscribe",
+                    "custom_feature_enabled": True
                 }
-                
+
                 await self.ws.send(json.dumps(subscribe_message))
                 logger.info(f"Subscribed to assets: {self.clob_token_ids}")
-                
+
                 self.running = True
                 self.reconnect_delay = 1.0
-                
-                # Start message handler
+
                 await self._handle_messages()
-                
+
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("WebSocket connection closed, reconnecting...")
                 self.running = False
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-                
+
             except Exception as e:
-                logger.error(f"WebSocket error: {e}", exc_info=True)
+                logger.error(f"WebSocket error: {e}")
                 self.running = False
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-    
+
     async def _handle_messages(self):
         """Process incoming WebSocket messages."""
         try:
             async for message in self.ws:
                 try:
                     data = json.loads(message)
-                    await self._process_message(data)
+                    self._process_message(data)
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse message: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}", exc_info=True)
         except websockets.exceptions.ConnectionClosed:
             logger.warning("Connection closed during message handling")
             self.running = False
-        except Exception as e:
-            logger.error(f"Error in message handler: {e}", exc_info=True)
-            self.running = False
-    
-    async def _process_message(self, data):
+
+    def _process_message(self, data):
         """Process a single WebSocket message."""
-        # Handle list messages (subscription confirmation with book snapshots)
+        # Handle list of books (first subscription response only)
         if isinstance(data, list):
-            logger.info(f"✅ Subscription confirmation received with {len(data)} book(s)")
-            # Process each book in the list
-            for i, book_data in enumerate(data):
-                if isinstance(book_data, dict) and book_data.get("event_type") == "book":
-                    asset_id = book_data.get("asset_id")
-                    await self._handle_book_message(book_data)
+            if not self._got_initial_books and len(data) >= 2:
+                self._handle_initial_books(data)
             return
-        
-        # Handle dict messages
-        if not isinstance(data, dict):
-            logger.warning(f"Unexpected message type: {type(data)}")
-            return
-        
-        event_type = data.get("event_type")
-        
-        # Check for different message formats
-        if event_type == "book":
-            await self._handle_book_message(data)
-        elif event_type == "price_change":
-            await self._handle_price_change_message(data)
-    
-    async def _handle_book_message(self, data: dict):
-        """
-        Handle snapshot (book) message.
-        Clears local book and populates with new snapshot.
-        """
+
+        # Handle best_bid_ask updates
+        if isinstance(data, dict) and data.get("event_type") == "best_bid_ask":
+            self._handle_best_bid_ask(data)
+
+    def _handle_initial_books(self, books: list):
+        """Handle initial book snapshots - process once on subscription."""
+        for book in books:
+            if book.get("event_type") != "book":
+                continue
+
+            asset_id = book.get("asset_id")
+            if not asset_id:
+                continue
+
+            is_yes = self._is_yes_token(asset_id)
+            if is_yes is None:
+                continue
+
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+
+            # Best bid (highest) is LAST element, best ask (lowest) is LAST element
+            best_bid = float(bids[-1]["price"]) * 1000 if bids else None
+            best_ask = float(asks[-1]["price"]) * 1000 if asks else None
+
+            if is_yes:
+                self.market_state.best_bid_yes = best_bid
+                self.market_state.best_ask_yes = best_ask
+                self.market_state.sync_status_yes = True
+            else:
+                self.market_state.best_bid_no = best_bid
+                self.market_state.best_ask_no = best_ask
+                self.market_state.sync_status_no = True
+
+            timestamp = book.get("timestamp")
+            if timestamp:
+                self.market_state.exchange_timestamp = int(timestamp)
+
+            side = "YES" if is_yes else "NO"
+            logger.info(f"Initial book {side}: bid={best_bid} ask={best_ask}")
+
+        self._got_initial_books = True
+        if self.market_state.sync_status:
+            logger.info("Both sides synced")
+
+    def _handle_best_bid_ask(self, data: dict):
+        """Handle best_bid_ask update - only notify if values changed."""
         asset_id = data.get("asset_id")
-        timestamp = data.get("timestamp")
         if not asset_id:
-            logger.warning("Book message missing asset_id")
             return
-        
-        # Determine which side (YES or NO)
-        # Book messages use CLOB token IDs as asset_ids
-        # Match against clob_token_ids (first = YES, second = NO typically)
+
+        is_yes = self._is_yes_token(asset_id)
+        if is_yes is None:
+            return
+
+        best_bid = data.get("best_bid")
+        best_ask = data.get("best_ask")
+
+        if best_bid is not None:
+            best_bid = float(best_bid) * 1000
+        if best_ask is not None:
+            best_ask = float(best_ask) * 1000
+
+        changed = False
+        if is_yes:
+            if best_bid is not None and best_bid != self.market_state.best_bid_yes:
+                self.market_state.best_bid_yes = best_bid
+                changed = True
+            if best_ask is not None and best_ask != self.market_state.best_ask_yes:
+                self.market_state.best_ask_yes = best_ask
+                changed = True
+        else:
+            if best_bid is not None and best_bid != self.market_state.best_bid_no:
+                self.market_state.best_bid_no = best_bid
+                changed = True
+            if best_ask is not None and best_ask != self.market_state.best_ask_no:
+                self.market_state.best_ask_no = best_ask
+                changed = True
+
+        timestamp = data.get("timestamp")
+        if timestamp:
+            self.market_state.exchange_timestamp = int(timestamp)
+
+        if changed and self.on_state_update:
+            self.on_state_update(self.market_state)
+
+    def _is_yes_token(self, asset_id: str) -> Optional[bool]:
+        """Determine if asset_id is YES token. Returns None if unknown."""
         if len(self.clob_token_ids) == 2:
             if asset_id == self.clob_token_ids[0]:
-                is_yes = True
+                return True
             elif asset_id == self.clob_token_ids[1]:
-                is_yes = False
-            else:
-                logger.warning(f"Unknown asset_id in book: {asset_id} (expected {self.clob_token_ids})")
-                return
-        else:
-            # Fallback to asset_id_yes/no matching
-            is_yes = asset_id == self.market_state.asset_id_yes
-            if asset_id not in [self.market_state.asset_id_yes, self.market_state.asset_id_no]:
-                logger.warning(f"Ignoring book message for unknown asset: {asset_id}")
-                return
-        
-        # Clear existing book for this asset
-        if is_yes:
-            self.market_state.order_book_yes_bids.clear()
-            self.market_state.order_book_yes_asks.clear()
-        else:
-            self.market_state.order_book_no_bids.clear()
-            self.market_state.order_book_no_asks.clear()
-        
-        # Book format: bids/asks are arrays of dicts with "price" and "size" as strings
-        # Prices are in decimal format (0.48 = 480 ticks, 0.52 = 520 ticks)
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        
-        # Populate bids
-        for level in bids:
-            if isinstance(level, dict):
-                price_decimal = float(level.get("price", 0))
-                # Convert decimal to ticks: 0.48 -> 480, 0.52 -> 520
-                price = price_decimal * 1000
-                size = float(level.get("size", 0))
-                
-                if price > 0 and size > 0:
-                    if is_yes:
-                        self.market_state.order_book_yes_bids[price] = size
-                    else:
-                        self.market_state.order_book_no_bids[price] = size
-        
-        # Populate asks
-        for level in asks:
-            if isinstance(level, dict):
-                price_decimal = float(level.get("price", 0))
-                # Convert decimal to ticks: 0.48 -> 480, 0.52 -> 520
-                price = price_decimal * 1000
-                size = float(level.get("size", 0))
-                
-                if price > 0 and size > 0:
-                    if is_yes:
-                        self.market_state.order_book_yes_asks[price] = size
-                    else:
-                        self.market_state.order_book_no_asks[price] = size
-        
-        # Update timestamp and clock skew
-        if timestamp:
-            self.market_state.exchange_timestamp = int(timestamp)
-            self.market_state.update_clock_skew()
-        
-        # Mark this side as synced
-        if is_yes:
-            was_synced = self.market_state.sync_status
-            self.market_state.sync_status_yes = True
-            if not was_synced and self.market_state.sync_status:
-                logger.info("🎯 Both books now synced! (YES + NO)")
-        else:
-            was_synced = self.market_state.sync_status
-            self.market_state.sync_status_no = True
-            if not was_synced and self.market_state.sync_status:
-                logger.info("🎯 Both books now synced! (YES + NO)")
-        
-        # Notify state update
-        if self.on_state_update:
-            self.on_state_update(self.market_state.snapshot())
-    
-    async def _handle_price_change_message(self, data: dict):
-        """
-        Handle delta (price_change) message.
-        Updates specific price levels in the order book.
-        """
-        if not self.market_state.sync_status:
-            return
-        
-        timestamp = data.get("timestamp")
-        price_changes = data.get("price_changes", [])
-        
-        if not price_changes:
-            return
-        
-        for change in price_changes:
-            asset_id = change.get("asset_id")
-            price_decimal = float(change.get("price", 0))
-            # Convert decimal to ticks: 0.5 -> 500
-            price = price_decimal * 1000
-            size = float(change.get("size", 0))
-            side = change.get("side")  # "BUY" or "SELL"
-            # Match asset_id against clob_token_ids (first = YES, second = NO)
-            if len(self.clob_token_ids) == 2:
-                if asset_id == self.clob_token_ids[0]:
-                    is_yes = True
-                elif asset_id == self.clob_token_ids[1]:
-                    is_yes = False
-                else:
-                    continue  # Skip unknown asset
-            else:
-                # Fallback to asset_id_yes/no matching
-                if asset_id not in [self.market_state.asset_id_yes, self.market_state.asset_id_no]:
-                    continue
-                is_yes = asset_id == self.market_state.asset_id_yes
-            
-            # Update the appropriate order book
-            if side == "BUY":
-                # Update bids
-                if is_yes:
-                    if size > 0:
-                        self.market_state.order_book_yes_bids[price] = size
-                    else:
-                        self.market_state.order_book_yes_bids.pop(price, None)
-                else:
-                    if size > 0:
-                        self.market_state.order_book_no_bids[price] = size
-                    else:
-                        self.market_state.order_book_no_bids.pop(price, None)
-            else:  # SELL
-                # Update asks
-                if is_yes:
-                    if size > 0:
-                        self.market_state.order_book_yes_asks[price] = size
-                    else:
-                        self.market_state.order_book_yes_asks.pop(price, None)
-                else:
-                    if size > 0:
-                        self.market_state.order_book_no_asks[price] = size
-                    else:
-                        self.market_state.order_book_no_asks.pop(price, None)
-        
-        # Update timestamp
-        if timestamp:
-            self.market_state.exchange_timestamp = int(timestamp)
-            self.market_state.update_clock_skew()
-        
-        # Notify state update
-        if self.on_state_update:
-            self.on_state_update(self.market_state.snapshot())
-    
+                return False
+        return None
+
     async def disconnect(self):
         """Close WebSocket connection."""
+        self._should_reconnect = False
         self.running = False
         if self.ws:
             await self.ws.close()
             logger.info("Disconnected from Polymarket WebSocket")
-    
+
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
         return self.running and self.ws is not None
-    
-    async def unsubscribe(self, clob_token_ids: list[str]):
-        """
-        Unsubscribe from specified CLOB token IDs.
-        
-        Args:
-            clob_token_ids: List of CLOB token IDs to unsubscribe from
-        """
-        if not self.is_connected():
-            logger.warning("Cannot unsubscribe: WebSocket not connected")
-            return
-        
-        unsubscribe_message = {
-            "assets_ids": clob_token_ids,
-            "operation": "unsubscribe"
-        }
-        
-        await self.ws.send(json.dumps(unsubscribe_message))
-        logger.info(f"Unsubscribed from assets: {clob_token_ids}")
-    
-    async def subscribe(self, clob_token_ids: list[str]):
-        """
-        Subscribe to specified CLOB token IDs.
-        
-        Args:
-            clob_token_ids: List of CLOB token IDs to subscribe to
-        """
-        if not self.is_connected():
-            logger.warning("Cannot subscribe: WebSocket not connected")
-            return
-        
-        subscribe_message = {
-            "assets_ids": clob_token_ids,
-            "operation": "subscribe"
-        }
-        
-        await self.ws.send(json.dumps(subscribe_message))
-        logger.info(f"Subscribed to assets: {clob_token_ids}")
-    
+
     async def switch_markets(self, new_clob_token_ids: list[str]):
-        """
-        Switch to a new market by unsubscribing from current and subscribing to new.
-        Resets sync status and clears order books.
-        
-        Args:
-            new_clob_token_ids: List of new CLOB token IDs to subscribe to
-        """
+        """Switch to a new market."""
         if not self.is_connected():
             logger.warning("Cannot switch markets: WebSocket not connected")
             return
-        
-        old_clob_token_ids = self.clob_token_ids.copy()
-        
-        # Reset sync status and clear order books for new market
+
+        old_ids = self.clob_token_ids
+
+        # Reset state
         self.market_state.sync_status_yes = False
         self.market_state.sync_status_no = False
-        self.market_state.order_book_yes_bids.clear()
-        self.market_state.order_book_yes_asks.clear()
-        self.market_state.order_book_no_bids.clear()
-        self.market_state.order_book_no_asks.clear()
-        
-        # Run unsubscribe and subscribe concurrently
-        await asyncio.gather(
-            self.unsubscribe(old_clob_token_ids),
-            self.subscribe(new_clob_token_ids)
-        )
-        
-        # Update clob_token_ids after both operations complete
-        self.clob_token_ids = new_clob_token_ids
-        logger.info(f"✅ Market switched: {old_clob_token_ids} -> {new_clob_token_ids}")
+        self.market_state.best_bid_yes = None
+        self.market_state.best_ask_yes = None
+        self.market_state.best_bid_no = None
+        self.market_state.best_ask_no = None
+        self._got_initial_books = False
 
+        # Unsubscribe and subscribe
+        await self.ws.send(json.dumps({"assets_ids": old_ids, "operation": "unsubscribe"}))
+        await self.ws.send(json.dumps({
+            "assets_ids": new_clob_token_ids,
+            "operation": "subscribe",
+            "custom_feature_enabled": True
+        }))
+
+        self.clob_token_ids = new_clob_token_ids
+        logger.info(f"Market switched: {old_ids} -> {new_clob_token_ids}")

@@ -1,38 +1,64 @@
 """
-Configuration constants for the trading bot.
+Configuration for Polymarket trading bot.
 """
+import os
+from dotenv import load_dotenv
 
-# Strategy Constants
-MAX_SHARES = 100  # Hard cap on exposure per side (~$50 risk)
-BALANCE_PAD = 10  # Max allowable share mismatch before forced hedging
-TARGET_PAIR = 980  # Target cost for a complete pair ($0.98 in ticks)
-STOP_LOSS = 0.25  # Price (25¢) to panic-sell a solo position
-FLOOR_THRESH = 0.20  # Do not "average down" if price drops below this
-BASE_SENSE = 50  # Oracle sensitivity divisor
-MAX_TRADE = 20  # Maximum size of a single order
+load_dotenv()  # Load .env file if present
 
-# Time-based thresholds (in minutes remaining)
-BOOTSTRAP_THRESHOLD_HIGH = 0.50  # Buy if price < 0.50 when T > 5m (relaxed from 0.40)
-BOOTSTRAP_THRESHOLD_LOW = 0.30   # Buy if price < 0.30 when 2m < T < 5m (relaxed from 0.15)
-BOOTSTRAP_KILL_ZONE = 2  # No entry if T < 2m
-BOOTSTRAP_HIGH_VOL_ZONE = 5  # High volatility zone threshold
+# =============================================================================
+# TRIPLE GATE STRATEGY PARAMETERS
+# =============================================================================
 
-# Oracle Filter Thresholds
-# Relaxed: Allow more trades by widening the block zones
-ORACLE_BLOCK_YES = 0.30  # Block YES buys if Model < 0.30 (was 0.40 - more permissive)
-ORACLE_BLOCK_NO = 0.70   # Block NO buys if Model > 0.70 (was 0.60 - more permissive)
+# Position limits
+MAX_POSITION = 75          # Max net exposure per side (replaces IMBALANCE_HARD)
 
-# Execution Constants
-LATENCY_MS = 150  # Simulated network round-trip time (150ms)
-PAYOUT_TICKS = 1000  # Payout per winning share (1000 ticks = $1.00)
-EXECUTION_MODE = "simulated"  # "simulated" or "real"
-SIMULATE_PARTIAL_FILLS = True
-PARTIAL_FILL_DELAY_MS = 200  # Delay between partial fills (ms)
+# Order sizing
+BASE_SIZE = 10             # Order size when neutral (shares)
+MIN_ORDER_SIZE = 5         # Polymarket minimum order size
 
-# WebSocket Endpoints
-POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+# Pricing
+BASE_MARGIN_TICKS = 15     # 1.5c minimum profit margin
+GAMMA = 0.001              # Skew sensitivity: 50 shares = 5c shift
+MAX_SKEW_TICKS = 100       # 10c max price shift from anchor
 
-# API Endpoints
+# Ladder
+LADDER_DEPTH = 5          # Number of rungs per side
+MIN_PRICE = 100            # Minimum order price in ticks (10c floor)
+
+# Execution
+SLIPPAGE_TOL_TICKS = 20    # 2c max spread crossing when light
+HYSTERESIS = 0.50          # 50% size tolerance before shrinking
+
+# Profit lock
+PROFIT_LOCK_MIN = 10.0     # Minimum guaranteed profit ($) to lock
+
+# =============================================================================
+# EXECUTION PARAMETERS
+# =============================================================================
+
+REFRESH_INTERVAL_MS = 2000   # Cancel + replace every 2 seconds
+TICK_SIZE = 10               # Polymarket tick size (10 ticks = 1¢)
+
+# =============================================================================
+# SAFETY LIMITS
+# =============================================================================
+
+CIRCUIT_BREAKER_USD = 200.0  # Emergency stop if total cost exceeds this
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137  # Polygon mainnet
+POLYMARKET_WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLYMARKET_WS_USER_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
+# =============================================================================
+# CREDENTIALS
+# =============================================================================
+
+PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+PROXY_WALLET = os.environ.get("POLYMARKET_PROXY_WALLET", "")
